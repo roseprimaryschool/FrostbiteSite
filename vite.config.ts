@@ -9,23 +9,15 @@ const __dirname = path.dirname(__filename);
 
 export default defineConfig(() => {
   return {
-    root: __dirname,
     plugins: [react(), tailwindcss()],
     resolve: {
       alias: {
-        '@': __dirname,
+        '@': path.resolve(__dirname, './src'),
       },
     },
     server: {
       hmr: process.env.DISABLE_HMR !== 'true',
       watch: process.env.DISABLE_HMR === 'true' ? null : {},
-    },
-    build: {
-      outDir: 'dist',
-      emptyOutDir: true,
-      rollupOptions: {
-        input: path.resolve(__dirname, 'index.html'),
-      },
     },
   };
 });

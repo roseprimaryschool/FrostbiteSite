@@ -1,6 +1,6 @@
 {
-  "name": "React App",
-  "description": "A simple React application built with Tailwind CSS.",
+  "name": "Frostbite MC",
+  "description": "Team site for the Frostbite Minecraft team",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
