@@ -1,347 +1,733 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { io, Socket } from 'socket.io-client';
+import * as THREE from 'three';
+import { PointerLockControls } from 'three/examples/jsm/controls/PointerLockControls.js';
+import { createNoise2D } from 'simplex-noise';
+import { Maximize, Play, Settings, Hammer, Plus } from 'lucide-react';
 
-const BLOCK_SIZE = 20;
+const noise2D = createNoise2D();
 
-const COLORS: Record<number, string> = {
-  0: 'transparent',
-  1: '#4ade80', // Grass
-  2: '#78350f', // Dirt
-  3: '#94a3b8', // Stone
-  4: '#b45309', // Wood
-  5: '#22c55e', // Leaves
+const WORLD_SIZE = 64;
+const WORLD_HEIGHT = 32;
+const CHUNK_SIZE = 16;
+
+const COLORS: Record<number, number> = {
+  1: 0x4ade80, // Grass
+  2: 0x78350f, // Dirt
+  3: 0x94a3b8, // Stone
+  4: 0xb45309, // Wood
+  5: 0x22c55e, // Leaves
+  6: 0xfde047, // Sand
+  7: 0x3b82f6, // Water
 };
 
-const ALL_SOLID = [1, 2, 3, 4, 5];
+const BLOCK_NAMES: Record<number, string> = {
+  1: 'Grass', 2: 'Dirt', 3: 'Stone', 4: 'Wood', 5: 'Leaves', 6: 'Sand', 7: 'Water'
+};
 
-interface FrostCraftProps {
-  currentUser: string;
-}
-
-export default function FrostCraft({ currentUser }: FrostCraftProps) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [socket, setSocket] = useState<Socket | null>(null);
+export default function FrostCraft() {
+  const [gameState, setGameState] = useState<'menu' | 'playing'>('menu');
+  const [isFullscreen, setIsFullscreen] = useState(false);
   const [selectedBlock, setSelectedBlock] = useState(1);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  
+  const blockRef = useRef(selectedBlock);
+  useEffect(() => { blockRef.current = selectedBlock; }, [selectedBlock]);
 
-  const stateRef = useRef({
-    world: [] as number[][],
-    width: 0,
-    height: 0,
-    players: {} as Record<string, any>,
-    me: {
-      x: 50 * BLOCK_SIZE,
-      y: 10 * BLOCK_SIZE,
-      vx: 0,
-      vy: 0,
-      width: 14,
-      height: 28,
-      facing: 1,
-      grounded: false
-    },
-    camera: { x: 0, y: 0 },
-    keys: { a: false, d: false, w: false, s: false, space: false },
-    mouse: { x: 0, y: 0, isDown: false, button: 0 },
-    selectedBlock: 1
-  });
+  const [isMobile, setIsMobile] = useState(false);
+  const [knobPos, setKnobPos] = useState({ x: 0, y: 0 });
 
   useEffect(() => {
-    stateRef.current.selectedBlock = selectedBlock;
-  }, [selectedBlock]);
+    const checkMobile = () => {
+        const hasTouch = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
+        const isMobileUA = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+        setIsMobile(hasTouch || isMobileUA);
+    };
+    checkMobile();
+    window.addEventListener('resize', checkMobile);
+    return () => window.removeEventListener('resize', checkMobile);
+  }, []);
+
+  const isMobileRef = useRef(isMobile);
+  useEffect(() => { isMobileRef.current = isMobile; }, [isMobile]);
+
+  const joystickDir = useRef({ x: 0, y: 0 });
+  const jumpPressed = useRef(false);
+  const knobRef = useRef<HTMLDivElement>(null);
+
+  const mobileActionsRef = useRef<{
+      breakBlock: () => void;
+      placeBlock: () => void;
+  } | null>(null);
+
+  const toggleFullscreen = () => {
+    if (!document.fullscreenElement) {
+      containerRef.current?.requestFullscreen().catch(err => {
+        console.error(`Error attempting to enable fullscreen: ${err.message}`);
+      });
+      setIsFullscreen(true);
+    } else {
+      document.exitFullscreen();
+      setIsFullscreen(false);
+    }
+  };
 
   useEffect(() => {
-    const newSocket = io();
-    setSocket(newSocket);
+    const handleFullscreenChange = () => {
+        setIsFullscreen(!!document.fullscreenElement);
+    };
+    document.addEventListener('fullscreenchange', handleFullscreenChange);
+    return () => document.removeEventListener('fullscreenchange', handleFullscreenChange);
+  }, []);
 
-    newSocket.emit('join_frostcraft', currentUser);
-
-    newSocket.on('frostcraft_init', (data) => {
-      stateRef.current.world = data.world;
-      stateRef.current.width = data.width;
-      stateRef.current.height = data.height;
-    });
-
-    newSocket.on('frostcraft_players', (players) => {
-      stateRef.current.players = players;
-    });
-
-    newSocket.on('frostcraft_block_update', (data) => {
-      const { x, y, type } = data;
-      if (stateRef.current.world[y] && stateRef.current.world[y][x] !== undefined) {
-         stateRef.current.world[y][x] = type;
-      }
-    });
+  useEffect(() => {
+    if (gameState !== 'playing' || !canvasRef.current || !containerRef.current) return;
 
     const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
+    const container = containerRef.current;
+    
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: false });
+    renderer.setSize(container.clientWidth, container.clientHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setClearColor(0x87CEEB);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
-    let animationFrame: number;
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.Fog(0x87CEEB, 20, 60);
 
-    const handleKeyDown = (e: KeyboardEvent) => {
-      const keys = stateRef.current.keys;
-      if (e.key === 'a' || e.key === 'A') keys.a = true;
-      if (e.key === 'd' || e.key === 'D') keys.d = true;
-      if (e.key === 'w' || e.key === 'W' || e.key === ' ') { keys.w = true; keys.space = true; }
-      if (e.key === 's' || e.key === 'S') keys.s = true;
+    const camera = new THREE.PerspectiveCamera(75, container.clientWidth / container.clientHeight, 0.1, 100);
+    const controls = new PointerLockControls(camera, document.body);
+    
+    // Lighting
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+    scene.add(ambientLight);
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    dirLight.position.set(50, 100, 50);
+    dirLight.castShadow = true;
+    dirLight.shadow.camera.top = 100;
+    dirLight.shadow.camera.bottom = -100;
+    dirLight.shadow.camera.left = -100;
+    dirLight.shadow.camera.right = 100;
+    dirLight.shadow.camera.near = 0.1;
+    dirLight.shadow.camera.far = 200;
+    dirLight.shadow.mapSize.width = 2048;
+    dirLight.shadow.mapSize.height = 2048;
+    scene.add(dirLight);
+
+    // World Data
+    const blocks = new Uint8Array(WORLD_SIZE * WORLD_HEIGHT * WORLD_SIZE);
+    
+    const getBlock = (x: number, y: number, z: number) => {
+        if (x < 0 || x >= WORLD_SIZE || y < 0 || y >= WORLD_HEIGHT || z < 0 || z >= WORLD_SIZE) return 0;
+        return blocks[x + z * WORLD_SIZE + y * WORLD_SIZE * WORLD_SIZE];
+    };
+    
+    const setBlock = (x: number, y: number, z: number, type: number) => {
+        if (x < 0 || x >= WORLD_SIZE || y < 0 || y >= WORLD_HEIGHT || z < 0 || z >= WORLD_SIZE) return;
+        blocks[x + z * WORLD_SIZE + y * WORLD_SIZE * WORLD_SIZE] = type;
     };
 
-    const handleKeyUp = (e: KeyboardEvent) => {
-      const keys = stateRef.current.keys;
-      if (e.key === 'a' || e.key === 'A') keys.a = false;
-      if (e.key === 'd' || e.key === 'D') keys.d = false;
-      if (e.key === 'w' || e.key === 'W' || e.key === ' ') { keys.w = false; keys.space = false; }
-      if (e.key === 's' || e.key === 'S') keys.s = false;
+    // Generate World
+    for (let x = 0; x < WORLD_SIZE; x++) {
+        for (let z = 0; z < WORLD_SIZE; z++) {
+            let height = 10 + Math.floor(noise2D(x / 30, z / 30) * 8);
+            height += Math.floor(noise2D(x / 10, z / 10) * 3);
+            
+            for (let y = 0; y < WORLD_HEIGHT; y++) {
+                if (y < height - 3) {
+                    setBlock(x, y, z, 3); // Stone
+                } else if (y < height) {
+                    setBlock(x, y, z, 2); // Dirt
+                } else if (y === height) {
+                    if (y <= 8) {
+                        setBlock(x, y, z, 6); // Sand
+                    } else {
+                        setBlock(x, y, z, 1); // Grass
+                    }
+                } else if (y <= 8 && y > height) {
+                    setBlock(x, y, z, 7); // Water
+                }
+            }
+            
+            // Trees
+            if (height > 8 && Math.random() < 0.02) {
+                const treeHeight = 4 + Math.floor(Math.random() * 2);
+                for (let ty = 1; ty <= treeHeight; ty++) {
+                    setBlock(x, height + ty, z, 4);
+                }
+                for (let ly = treeHeight - 2; ly <= treeHeight + 1; ly++) {
+                    for (let lx = -2; lx <= 2; lx++) {
+                        for (let lz = -2; lz <= 2; lz++) {
+                            if (Math.abs(lx) === 2 && Math.abs(lz) === 2 && (ly === treeHeight + 1 || Math.random() < 0.5)) continue;
+                            if (getBlock(x + lx, height + ly, z + lz) === 0) {
+                                setBlock(x + lx, height + ly, z + lz, 5);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Meshing
+    const chunkMeshes: Record<string, THREE.InstancedMesh[]> = {};
+    const boxGeo = new THREE.BoxGeometry(1, 1, 1);
+    const materials: Record<number, THREE.Material> = {};
+    Object.keys(COLORS).forEach(k => {
+        const type = parseInt(k);
+        const mat = new THREE.MeshLambertMaterial({ color: COLORS[type] });
+        if (type === 7) { mat.transparent = true; mat.opacity = 0.7; }
+        if (type === 5) { mat.transparent = true; mat.opacity = 0.9; }
+        materials[type] = mat;
+    });
+
+    const rebuildChunk = (cx: number, cz: number) => {
+        const chunkId = `${cx},${cz}`;
+        if (chunkMeshes[chunkId]) {
+            chunkMeshes[chunkId].forEach(m => scene.remove(m));
+        }
+        chunkMeshes[chunkId] = [];
+        
+        const typeBlocks: Record<number, {x: number, y: number, z: number}[]> = {};
+        Object.keys(COLORS).forEach(k => typeBlocks[parseInt(k)] = []);
+        
+        for (let x = cx * CHUNK_SIZE; x < (cx + 1) * CHUNK_SIZE; x++) {
+            for (let z = cz * CHUNK_SIZE; z < (cz + 1) * CHUNK_SIZE; z++) {
+                for (let y = 0; y < WORLD_HEIGHT; y++) {
+                    const type = getBlock(x, y, z);
+                    if (type !== 0) {
+                        let exposed = false;
+                        const neighbors = [
+                            getBlock(x+1, y, z), getBlock(x-1, y, z),
+                            getBlock(x, y+1, z), getBlock(x, y-1, z),
+                            getBlock(x, y, z+1), getBlock(x, y, z-1)
+                        ];
+                        for(let n of neighbors) {
+                            if (n === 0) { exposed = true; break; }
+                            if ((type === 5 || type === 7) && n !== type) { exposed = true; break; }
+                        }
+                        if (exposed) typeBlocks[type].push({x, y, z});
+                    }
+                }
+            }
+        }
+        
+        const dummy = new THREE.Object3D();
+        Object.keys(typeBlocks).forEach(key => {
+            const type = parseInt(key);
+            const blocks = typeBlocks[type];
+            if (blocks.length === 0) return;
+            
+            const mesh = new THREE.InstancedMesh(boxGeo, materials[type], blocks.length);
+            blocks.forEach((pos, i) => {
+                dummy.position.set(pos.x, pos.y, pos.z);
+                dummy.updateMatrix();
+                mesh.setMatrixAt(i, dummy.matrix);
+            });
+            mesh.instanceMatrix.needsUpdate = true;
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+            scene.add(mesh);
+            chunkMeshes[chunkId].push(mesh);
+        });
     };
 
-    const handleMouseMove = (e: MouseEvent) => {
-      const rect = canvas.getBoundingClientRect();
-      stateRef.current.mouse.x = e.clientX - rect.left;
-      stateRef.current.mouse.y = e.clientY - rect.top;
+    // Build all chunks initially
+    for (let cx = 0; cx < WORLD_SIZE / CHUNK_SIZE; cx++) {
+        for (let cz = 0; cz < WORLD_SIZE / CHUNK_SIZE; cz++) {
+            rebuildChunk(cx, cz);
+        }
+    }
+
+    // Player State
+    const player = {
+        x: WORLD_SIZE / 2,
+        y: WORLD_HEIGHT,
+        z: WORLD_SIZE / 2,
+        vx: 0, vy: 0, vz: 0,
+        radius: 0.3,
+        height: 1.6
+    };
+    
+    // Spawn point
+    for (let y = WORLD_HEIGHT - 1; y >= 0; y--) {
+        if (getBlock(Math.floor(player.x), y, Math.floor(player.z)) !== 0) {
+            player.y = y + 2;
+            break;
+        }
+    }
+    camera.position.set(player.x, player.y + player.height * 0.8, player.z);
+
+    // Controls
+    const keys: Record<string, boolean> = {};
+    const onKeyDown = (e: KeyboardEvent) => keys[e.code] = true;
+    const onKeyUp = (e: KeyboardEvent) => keys[e.code] = false;
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+
+    // Number keys for block selection
+    const onNumKey = (e: KeyboardEvent) => {
+        if (e.code.startsWith('Digit')) {
+            const num = parseInt(e.code.replace('Digit', ''));
+            if (num >= 1 && num <= 7) {
+                setSelectedBlock(num);
+            }
+        }
+    };
+    window.addEventListener('keydown', onNumKey);
+
+    const isSolid = (x: number, y: number, z: number) => {
+        const b = getBlock(x, y, z);
+        return b !== 0 && b !== 7; // Water is not solid
     };
 
-    const handleMouseDown = (e: MouseEvent) => {
-      stateRef.current.mouse.isDown = true;
-      stateRef.current.mouse.button = e.button; 
-      interactWithWorld();
+    const checkCollision = (px: number, py: number, pz: number) => {
+        const minX = Math.floor(px - player.radius);
+        const maxX = Math.floor(px + player.radius);
+        const minY = Math.floor(py);
+        const maxY = Math.floor(py + player.height);
+        const minZ = Math.floor(pz - player.radius);
+        const maxZ = Math.floor(pz + player.radius);
+        
+        for (let x = minX; x <= maxX; x++) {
+            for (let y = minY; y <= maxY; y++) {
+                for (let z = minZ; z <= maxZ; z++) {
+                    if (isSolid(x, y, z)) return true;
+                }
+            }
+        }
+        return false;
     };
 
-    const handleMouseUp = (e: MouseEvent) => {
-      stateRef.current.mouse.isDown = false;
+    const breakBlock = () => {
+        let step = 0.05;
+        let maxDist = 6;
+        const pos = camera.position.clone();
+        const dir = new THREE.Vector3();
+        camera.getWorldDirection(dir);
+        
+        for (let d = 0; d < maxDist; d += step) {
+            pos.addVectors(camera.position, dir.clone().multiplyScalar(d));
+            const bx = Math.floor(pos.x + 0.5);
+            const by = Math.floor(pos.y + 0.5);
+            const bz = Math.floor(pos.z + 0.5);
+            
+            if (getBlock(bx, by, bz) !== 0 && getBlock(bx, by, bz) !== 7) {
+                setBlock(bx, by, bz, 0);
+                rebuildChunk(Math.floor(bx / CHUNK_SIZE), Math.floor(bz / CHUNK_SIZE));
+                break;
+            }
+        }
     };
 
-    const interactWithWorld = () => {
-       const state = stateRef.current;
-       if (!state.world.length) return;
-       
-       const mx = state.mouse.x + state.camera.x;
-       const my = state.mouse.y + state.camera.y;
-       const tx = Math.floor(mx / BLOCK_SIZE);
-       const ty = Math.floor(my / BLOCK_SIZE);
-
-       if (tx >= 0 && tx < state.width && ty >= 0 && ty < state.height) {
-          const dx = tx * BLOCK_SIZE + BLOCK_SIZE/2 - (state.me.x + state.me.width/2);
-          const dy = ty * BLOCK_SIZE + BLOCK_SIZE/2 - (state.me.y + state.me.height/2);
-          if (Math.sqrt(dx*dx + dy*dy) > 100) return; // Too far
-
-          if (state.mouse.button === 0) {
-             // Break
-             if (state.world[ty][tx] !== 0) {
-                newSocket.emit('frostcraft_set_block', { x: tx, y: ty, type: 0 });
-                state.world[ty][tx] = 0;
-             }
-          } else if (state.mouse.button === 2) {
-             // Place
-             if (state.world[ty][tx] === 0) {
-                newSocket.emit('frostcraft_set_block', { x: tx, y: ty, type: state.selectedBlock });
-                state.world[ty][tx] = state.selectedBlock;
-             }
-          }
-       }
+    const placeBlock = () => {
+        let step = 0.05;
+        let maxDist = 6;
+        const pos = camera.position.clone();
+        const dir = new THREE.Vector3();
+        camera.getWorldDirection(dir);
+        
+        let lastPos = pos.clone();
+        for (let d = 0; d < maxDist; d += step) {
+            pos.addVectors(camera.position, dir.clone().multiplyScalar(d));
+            const bx = Math.floor(pos.x + 0.5);
+            const by = Math.floor(pos.y + 0.5);
+            const bz = Math.floor(pos.z + 0.5);
+            
+            if (getBlock(bx, by, bz) !== 0 && getBlock(bx, by, bz) !== 7) {
+                const lbx = Math.floor(lastPos.x + 0.5);
+                const lby = Math.floor(lastPos.y + 0.5);
+                const lbz = Math.floor(lastPos.z + 0.5);
+                // Don't place inside player
+                if (!checkCollision(lbx, lby, lbz) || 
+                    (Math.abs(lbx - player.x) > player.radius || Math.abs(lbz - player.z) > player.radius || lby < player.y || lby > player.y + player.height)) {
+                    setBlock(lbx, lby, lbz, blockRef.current);
+                    rebuildChunk(Math.floor(lbx / CHUNK_SIZE), Math.floor(lbz / CHUNK_SIZE));
+                }
+                break;
+            }
+            lastPos.copy(pos);
+        }
     };
 
-    const handleContextMenu = (e: Event) => e.preventDefault();
+    // Assign actions to ref so React UI buttons can trigger them
+    mobileActionsRef.current = {
+        breakBlock,
+        placeBlock
+    };
 
-    window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('keyup', handleKeyUp);
-    canvas.addEventListener('mousemove', handleMouseMove);
-    canvas.addEventListener('mousedown', handleMouseDown);
-    canvas.addEventListener('mouseup', handleMouseUp);
-    canvas.addEventListener('contextmenu', handleContextMenu);
+    // Interaction
+    const onMouseClick = (e: MouseEvent) => {
+        if (isMobileRef.current) return;
 
+        if (e.target instanceof Element && e.target.closest('button')) {
+            return;
+        }
+
+        if (!controls.isLocked) {
+            controls.lock();
+            return;
+        }
+        
+        if (e.button === 0) {
+            breakBlock();
+        } else if (e.button === 2) {
+            placeBlock();
+        }
+    };
+    document.addEventListener('mousedown', onMouseClick);
+
+    // Touch look rotation logic for mobile
+    let lookTouchId: number | null = null;
+    let lastLookPos = { x: 0, y: 0 };
+
+    const onTouchStart = (e: TouchEvent) => {
+        const target = e.target as HTMLElement;
+        if (target.closest('button') || target.closest('#joystick-container')) {
+            return;
+        }
+        
+        // Prevent default screen scrolling/bouncing on mobile during play
+        e.preventDefault();
+
+        const touch = e.changedTouches[0];
+        lookTouchId = touch.identifier;
+        lastLookPos = { x: touch.clientX, y: touch.clientY };
+    };
+
+    const onTouchMove = (e: TouchEvent) => {
+        if (lookTouchId === null) return;
+        
+        // Prevent scrolling
+        e.preventDefault();
+
+        let touch: Touch | null = null;
+        for (let i = 0; i < e.touches.length; i++) {
+            if (e.touches[i].identifier === lookTouchId) {
+                touch = e.touches[i];
+                break;
+            }
+        }
+        if (!touch) return;
+
+        const dx = touch.clientX - lastLookPos.x;
+        const dy = touch.clientY - lastLookPos.y;
+
+        // Apply camera rotation
+        const sensitivity = 0.005;
+        camera.rotation.y -= dx * sensitivity;
+        camera.rotation.x -= dy * sensitivity;
+        camera.rotation.x = Math.max(-Math.PI / 2 + 0.05, Math.min(Math.PI / 2 - 0.05, camera.rotation.x));
+
+        lastLookPos = { x: touch.clientX, y: touch.clientY };
+    };
+
+    const onTouchEnd = (e: TouchEvent) => {
+        if (lookTouchId === null) return;
+        
+        let ended = false;
+        for (let i = 0; i < e.changedTouches.length; i++) {
+            if (e.changedTouches[i].identifier === lookTouchId) {
+                ended = true;
+                break;
+            }
+        }
+        
+        if (ended) {
+            lookTouchId = null;
+        }
+    };
+
+    window.addEventListener('touchstart', onTouchStart, { passive: false });
+    window.addEventListener('touchmove', onTouchMove, { passive: false });
+    window.addEventListener('touchend', onTouchEnd);
+    window.addEventListener('touchcancel', onTouchEnd);
+    
+    // Resize handler
+    const onResize = () => {
+        if (!containerRef.current) return;
+        const w = containerRef.current.clientWidth;
+        const h = containerRef.current.clientHeight;
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+        renderer.setSize(w, h);
+    };
+    window.addEventListener('resize', onResize);
+
+    // Game loop
     let lastTime = performance.now();
-
-    const isSolid = (tx: number, ty: number) => {
-       if (tx < 0 || tx >= stateRef.current.width || ty < 0 || ty >= stateRef.current.height) return true;
-       return ALL_SOLID.includes(stateRef.current.world[ty][tx]);
-    };
-
-    const checkCollision = (x: number, y: number, w: number, h: number) => {
-       const tx1 = Math.floor(x / BLOCK_SIZE);
-       const tx2 = Math.floor((x + w - 1) / BLOCK_SIZE);
-       const ty1 = Math.floor(y / BLOCK_SIZE);
-       const ty2 = Math.floor((y + h - 1) / BLOCK_SIZE);
-
-       for (let ty = ty1; ty <= ty2; ty++) {
-          for (let tx = tx1; tx <= tx2; tx++) {
-             if (isSolid(tx, ty)) return true;
-          }
-       }
-       return false;
-    };
-
-    let syncTimer = 0;
+    let reqId: number;
 
     const loop = (time: number) => {
-      const dt = Math.min((time - lastTime) / 1000, 0.1);
-      lastTime = time;
-      const state = stateRef.current;
+        reqId = requestAnimationFrame(loop);
+        const dt = Math.min((time - lastTime) / 1000, 0.1);
+        lastTime = time;
 
-      if (state.world.length > 0) {
-        const speed = 150;
-        const gravity = 600;
-        const jumpForce = 300;
-
-        if (state.keys.a) { state.me.vx = -speed; state.me.facing = -1; }
-        else if (state.keys.d) { state.me.vx = speed; state.me.facing = 1; }
-        else state.me.vx = 0;
-
-        state.me.vy += gravity * dt;
-
-        let nextX = state.me.x + state.me.vx * dt;
-        if (!checkCollision(nextX, state.me.y, state.me.width, state.me.height)) {
-           state.me.x = nextX;
-        } else {
-           state.me.vx = 0;
-           state.me.x = Math.round(state.me.x);
-        }
-
-        let nextY = state.me.y + state.me.vy * dt;
-        state.me.grounded = false;
-        if (!checkCollision(state.me.x, nextY, state.me.width, state.me.height)) {
-           state.me.y = nextY;
-        } else {
-           if (state.me.vy > 0) state.me.grounded = true;
-           state.me.vy = 0;
-           state.me.y = Math.round(state.me.y);
-        }
-
-        if (state.keys.w && state.me.grounded) {
-           state.me.vy = -jumpForce;
-        }
-
-        state.camera.x = state.me.x + state.me.width / 2 - canvas.width / 2;
-        state.camera.y = state.me.y + state.me.height / 2 - canvas.height / 2;
-
-        state.camera.x = Math.max(0, Math.min(state.camera.x, state.width * BLOCK_SIZE - canvas.width));
-        state.camera.y = Math.max(0, Math.min(state.camera.y, state.height * BLOCK_SIZE - canvas.height));
-
-        syncTimer += dt;
-        if (syncTimer > 0.05) { 
-           syncTimer = 0;
-           newSocket.emit('frostcraft_update_pos', { x: state.me.x, y: state.me.y, facing: state.me.facing });
-        }
-      }
-
-      ctx.fillStyle = '#0f172a'; // Deep sky
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-      ctx.save();
-      ctx.translate(-state.camera.x, -state.camera.y);
-
-      if (state.world.length > 0) {
-         const startX = Math.max(0, Math.floor(state.camera.x / BLOCK_SIZE));
-         const endX = Math.min(state.width, Math.ceil((state.camera.x + canvas.width) / BLOCK_SIZE));
-         const startY = Math.max(0, Math.floor(state.camera.y / BLOCK_SIZE));
-         const endY = Math.min(state.height, Math.ceil((state.camera.y + canvas.height) / BLOCK_SIZE));
-
-         for (let y = startY; y < endY; y++) {
-            for (let x = startX; x < endX; x++) {
-               const type = state.world[y][x];
-               if (type !== 0) {
-                  ctx.fillStyle = COLORS[type];
-                  ctx.fillRect(x * BLOCK_SIZE, y * BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE);
-                  ctx.strokeStyle = 'rgba(0,0,0,0.2)';
-                  ctx.strokeRect(x * BLOCK_SIZE, y * BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE);
-               }
+        if (controls.isLocked || isMobileRef.current) {
+            player.vy -= 25 * dt; // gravity
+            
+            const speed = keys['ShiftLeft'] ? 8 : 5;
+            const inputVelocity = new THREE.Vector3();
+            
+            if (isMobileRef.current) {
+                inputVelocity.z = joystickDir.current.y;
+                inputVelocity.x = joystickDir.current.x;
+                const len = inputVelocity.length();
+                if (len > 0) {
+                    const scale = Math.min(len, 1.0) * speed;
+                    inputVelocity.normalize().multiplyScalar(scale);
+                }
+            } else {
+                if (keys['KeyW']) inputVelocity.z -= 1;
+                if (keys['KeyS']) inputVelocity.z += 1;
+                if (keys['KeyA']) inputVelocity.x -= 1;
+                if (keys['KeyD']) inputVelocity.x += 1;
+                if (inputVelocity.length() > 0) inputVelocity.normalize().multiplyScalar(speed);
             }
-         }
-      }
+            
+            const euler = new THREE.Euler(0, camera.rotation.y, 0, 'YXZ');
+            inputVelocity.applyEuler(euler);
+            
+            player.vx = inputVelocity.x;
+            player.vz = inputVelocity.z;
+            
+            player.x += player.vx * dt;
+            if (checkCollision(player.x, player.y, player.z)) {
+                player.x -= player.vx * dt;
+            }
+            
+            player.z += player.vz * dt;
+            if (checkCollision(player.x, player.y, player.z)) {
+                player.z -= player.vz * dt;
+            }
+            
+            player.y += player.vy * dt;
+            let grounded = false;
+            if (checkCollision(player.x, player.y, player.z)) {
+                player.y -= player.vy * dt;
+                if (player.vy < 0) grounded = true;
+                player.vy = 0;
+            }
+            
+            // Swim in water
+            if (getBlock(Math.floor(player.x), Math.floor(player.y), Math.floor(player.z)) === 7) {
+                player.vy *= 0.8; // water friction
+                if (keys['Space'] || jumpPressed.current) player.vy += 15 * dt;
+                grounded = false;
+            } else if (grounded && (keys['Space'] || jumpPressed.current)) {
+                player.vy = 8;
+            }
+            
+            camera.position.set(player.x, player.y + player.height * 0.8, player.z);
+        }
 
-      for (const id in state.players) {
-         const p = state.players[id];
-         if (id === newSocket.id) continue;
-         
-         ctx.fillStyle = p.color || '#fff';
-         ctx.fillRect(p.x, p.y, 14, 28);
-         
-         ctx.fillStyle = '#000';
-         if (p.facing === 1) {
-            ctx.fillRect(p.x + 8, p.y + 4, 3, 3);
-         } else {
-            ctx.fillRect(p.x + 3, p.y + 4, 3, 3);
-         }
-
-         ctx.fillStyle = '#fff';
-         ctx.font = '10px sans-serif';
-         ctx.textAlign = 'center';
-         ctx.fillText(p.user, p.x + 7, p.y - 5);
-      }
-
-      ctx.fillStyle = '#fff';
-      ctx.fillRect(state.me.x, state.me.y, state.me.width, state.me.height);
-      ctx.fillStyle = '#000';
-      if (state.me.facing === 1) {
-         ctx.fillRect(state.me.x + 8, state.me.y + 4, 3, 3);
-      } else {
-         ctx.fillRect(state.me.x + 3, state.me.y + 4, 3, 3);
-      }
-      ctx.fillStyle = '#cyan';
-      ctx.font = '10px sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillText(currentUser, state.me.x + state.me.width/2, state.me.y - 5);
-
-      const mx = state.mouse.x + state.camera.x;
-      const my = state.mouse.y + state.camera.y;
-      const tx = Math.floor(mx / BLOCK_SIZE);
-      const ty = Math.floor(my / BLOCK_SIZE);
-      if (tx >= 0 && tx < state.width && ty >= 0 && ty < state.height) {
-         ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)';
-         ctx.lineWidth = 2;
-         ctx.strokeRect(tx * BLOCK_SIZE, ty * BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE);
-      }
-
-      ctx.restore();
-
-      animationFrame = requestAnimationFrame(loop);
+        renderer.render(scene, camera);
     };
-
-    animationFrame = requestAnimationFrame(loop);
+    reqId = requestAnimationFrame(loop);
 
     return () => {
-      window.removeEventListener('keydown', handleKeyDown);
-      window.removeEventListener('keyup', handleKeyUp);
-      canvas.removeEventListener('mousemove', handleMouseMove);
-      canvas.removeEventListener('mousedown', handleMouseDown);
-      canvas.removeEventListener('mouseup', handleMouseUp);
-      canvas.removeEventListener('contextmenu', handleContextMenu);
-      cancelAnimationFrame(animationFrame);
-      newSocket.emit('leave_frostcraft');
-      newSocket.disconnect();
+        cancelAnimationFrame(reqId);
+        window.removeEventListener('keydown', onKeyDown);
+        window.removeEventListener('keyup', onKeyUp);
+        window.removeEventListener('keydown', onNumKey);
+        document.removeEventListener('mousedown', onMouseClick);
+        window.removeEventListener('touchstart', onTouchStart);
+        window.removeEventListener('touchmove', onTouchMove);
+        window.removeEventListener('touchend', onTouchEnd);
+        window.removeEventListener('touchcancel', onTouchEnd);
+        window.removeEventListener('resize', onResize);
+        controls.unlock();
+        renderer.dispose();
     };
-  }, [currentUser]);
+  }, [gameState]);
+
+  const handleJoystickStart = (e: React.TouchEvent<HTMLDivElement>) => {
+    e.stopPropagation();
+    const touch = e.targetTouches[0];
+    const rect = e.currentTarget.getBoundingClientRect();
+    const centerX = rect.width / 2;
+    const centerY = rect.height / 2;
+    const x = touch.clientX - rect.left - centerX;
+    const y = touch.clientY - rect.top - centerY;
+    
+    const distance = Math.sqrt(x*x + y*y);
+    const maxRadius = 40;
+    if (distance <= maxRadius) {
+      setKnobPos({ x, y });
+      joystickDir.current = { x: x / maxRadius, y: y / maxRadius };
+    } else {
+      const angle = Math.atan2(y, x);
+      const nx = Math.cos(angle) * maxRadius;
+      const ny = Math.sin(angle) * maxRadius;
+      setKnobPos({ x: nx, y: ny });
+      joystickDir.current = { x: nx / maxRadius, y: ny / maxRadius };
+    }
+  };
+
+  const handleJoystickMove = (e: React.TouchEvent<HTMLDivElement>) => {
+    e.stopPropagation();
+    const touch = e.targetTouches[0];
+    const rect = e.currentTarget.getBoundingClientRect();
+    const centerX = rect.width / 2;
+    const centerY = rect.height / 2;
+    const x = touch.clientX - rect.left - centerX;
+    const y = touch.clientY - rect.top - centerY;
+    
+    const distance = Math.sqrt(x*x + y*y);
+    const maxRadius = 40;
+    if (distance <= maxRadius) {
+      setKnobPos({ x, y });
+      joystickDir.current = { x: x / maxRadius, y: y / maxRadius };
+    } else {
+      const angle = Math.atan2(y, x);
+      const nx = Math.cos(angle) * maxRadius;
+      const ny = Math.sin(angle) * maxRadius;
+      setKnobPos({ x: nx, y: ny });
+      joystickDir.current = { x: nx / maxRadius, y: ny / maxRadius };
+    }
+  };
+
+  const handleJoystickEnd = (e: React.TouchEvent<HTMLDivElement>) => {
+    e.stopPropagation();
+    setKnobPos({ x: 0, y: 0 });
+    joystickDir.current = { x: 0, y: 0 };
+  };
+
+  if (gameState === 'menu') {
+      return (
+          <div className="bg-slate-900 border border-slate-700 rounded-2xl w-full h-[600px] flex flex-col items-center justify-center relative overflow-hidden">
+             {/* Simple aesthetic background for menu */}
+             <div className="absolute inset-0 opacity-20 pointer-events-none" style={{
+                 backgroundImage: 'radial-gradient(circle at center, #3b82f6 0%, transparent 70%)'
+             }}></div>
+             
+             <h1 className="text-6xl font-bold text-white mb-2 tracking-tighter" style={{ textShadow: '0 4px 10px rgba(0,0,0,0.5)' }}>FrostCraft</h1>
+             <p className="text-blue-300 mb-12 text-lg font-medium tracking-wide">SINGLEPLAYER 3D EDITION</p>
+             
+             <button 
+                onClick={() => setGameState('playing')}
+                className="flex items-center space-x-3 bg-white text-slate-900 px-8 py-4 rounded-xl font-bold text-xl hover:bg-blue-50 transition-all transform hover:scale-105 shadow-[0_0_20px_rgba(255,255,255,0.3)]"
+             >
+                 <Play className="w-6 h-6 fill-current" />
+                 <span>PLAY GAME</span>
+             </button>
+             
+             <div className="absolute bottom-8 text-slate-500 text-sm flex gap-6 font-medium">
+                <span>WASD to move</span>
+                <span>SPACE to jump</span>
+                <span>L/R Click to interact</span>
+                <span>1-7 to select blocks</span>
+             </div>
+          </div>
+      );
+  }
 
   return (
-    <div className="bg-slate-900/30 border border-cyan-900/20 rounded-2xl p-6 flex flex-col items-center justify-center relative">
-      <h2 className="text-xl font-bold text-slate-200 mb-2 w-full text-left">FrostCraft (Multiplayer Sandbox)</h2>
+    <div 
+        ref={containerRef} 
+        className={`relative ${isFullscreen ? 'fixed inset-0 z-50 bg-black' : 'w-full h-[600px] rounded-2xl overflow-hidden border border-slate-700'}`}
+    >
+      <canvas ref={canvasRef} className="w-full h-full block" />
       
-      <div className="flex gap-2 mb-4 bg-slate-950 p-2 rounded-lg border border-slate-800">
-         {[
-           { id: 1, name: 'Grass', color: COLORS[1] },
-           { id: 2, name: 'Dirt', color: COLORS[2] },
-           { id: 3, name: 'Stone', color: COLORS[3] },
-           { id: 4, name: 'Wood', color: COLORS[4] },
-           { id: 5, name: 'Leaves', color: COLORS[5] }
-         ].map(b => (
-           <button
-             key={b.id}
-             onClick={() => setSelectedBlock(b.id)}
-             className={`flex flex-col items-center p-2 rounded border-2 transition-all ${selectedBlock === b.id ? 'border-white bg-slate-800' : 'border-transparent hover:bg-slate-800'}`}
-           >
-              <div className="w-6 h-6 rounded-sm shadow-inner" style={{ backgroundColor: b.color }}></div>
-              <span className="text-[10px] mt-1 text-slate-300">{b.name}</span>
-           </button>
-         ))}
+      {/* Crosshair */}
+      <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+          <div className="relative w-4 h-4">
+              <div className="absolute top-1/2 left-0 w-full h-[2px] bg-white/70 -translate-y-1/2"></div>
+              <div className="absolute left-1/2 top-0 h-full w-[2px] bg-white/70 -translate-x-1/2"></div>
+          </div>
+      </div>
+      
+      {/* UI Overlay */}
+      <div className="absolute top-4 right-4 flex space-x-2 z-10">
+          <button 
+              onClick={() => setIsMobile(!isMobile)}
+              className={`px-3 py-1.5 text-xs font-bold rounded-lg backdrop-blur-sm transition-all cursor-pointer ${isMobile ? 'bg-blue-600/90 text-white shadow-lg' : 'bg-black/50 hover:bg-black/70 text-slate-300'}`}
+          >
+              {isMobile ? 'Mobile: On' : 'Mobile: Off'}
+          </button>
+          <button 
+              onClick={toggleFullscreen}
+              className="p-2 bg-black/50 hover:bg-black/70 text-white rounded-lg backdrop-blur-sm transition-colors cursor-pointer"
+          >
+              <Maximize className="w-5 h-5" />
+          </button>
       </div>
 
-      <div className="border border-cyan-900/50 shadow-lg shadow-cyan-900/20 rounded-lg overflow-hidden bg-slate-950 relative">
-        <canvas ref={canvasRef} width={800} height={400} className="max-w-full cursor-crosshair block" />
+      <div className="absolute top-4 left-4 text-white/80 bg-black/40 px-3 py-1 rounded-lg backdrop-blur-sm text-sm font-mono pointer-events-none z-10">
+          {isMobile ? 'Drag right screen to look' : 'ESC to unlock mouse'}
       </div>
-      <p className="mt-4 text-slate-400 text-sm flex gap-4">
-        <span><b>WASD</b>: Move/Jump</span>
-        <span><b>Left Click</b>: Break Block</span>
-        <span><b>Right Click</b>: Place Block</span>
-      </p>
+
+      {/* Mobile Controls Overlay */}
+      {isMobile && (
+        <>
+          {/* Joystick (Bottom Left) */}
+          <div 
+            id="joystick-container"
+            onTouchStart={handleJoystickStart}
+            onTouchMove={handleJoystickMove}
+            onTouchEnd={handleJoystickEnd}
+            className="absolute bottom-6 left-6 w-32 h-32 rounded-full bg-black/40 border-2 border-white/20 backdrop-blur-sm flex items-center justify-center select-none z-10 touch-none"
+          >
+            <div className="w-8 h-8 rounded-full border border-white/10 absolute"></div>
+            
+            {/* Knob */}
+            <div 
+              ref={knobRef}
+              className="w-12 h-12 rounded-full bg-white/85 shadow-lg absolute pointer-events-none"
+              style={{
+                transform: `translate(${knobPos.x}px, ${knobPos.y}px)`
+              }}
+            ></div>
+          </div>
+
+          {/* Action Buttons (Bottom Right) */}
+          <div className="absolute bottom-6 right-6 flex flex-col space-y-3 z-10 select-none touch-none">
+              {/* Mine / Break */}
+              <button 
+                  onTouchStart={(e) => { e.stopPropagation(); mobileActionsRef.current?.breakBlock(); }}
+                  onClick={(e) => { e.stopPropagation(); mobileActionsRef.current?.breakBlock(); }}
+                  className="w-14 h-14 bg-red-600/90 active:bg-red-700 active:scale-95 text-white rounded-full flex items-center justify-center shadow-lg border border-white/20 cursor-pointer"
+              >
+                  <Hammer className="w-6 h-6" />
+              </button>
+              
+              {/* Build / Place */}
+              <button 
+                  onTouchStart={(e) => { e.stopPropagation(); mobileActionsRef.current?.placeBlock(); }}
+                  onClick={(e) => { e.stopPropagation(); mobileActionsRef.current?.placeBlock(); }}
+                  className="w-14 h-14 bg-green-600/90 active:bg-green-700 active:scale-95 text-white rounded-full flex items-center justify-center shadow-lg border border-white/20 cursor-pointer"
+              >
+                  <Plus className="w-6 h-6" />
+              </button>
+
+              {/* Jump */}
+              <button 
+                  onTouchStart={(e) => { e.stopPropagation(); jumpPressed.current = true; }}
+                  onTouchEnd={(e) => { e.stopPropagation(); jumpPressed.current = false; }}
+                  onMouseDown={(e) => { e.stopPropagation(); jumpPressed.current = true; }}
+                  onMouseUp={(e) => { e.stopPropagation(); jumpPressed.current = false; }}
+                  className="w-16 h-16 bg-blue-600/90 active:bg-blue-700 active:scale-95 text-white rounded-full flex items-center justify-center shadow-xl font-bold border-2 border-white/30 text-xs cursor-pointer"
+              >
+                  JUMP
+              </button>
+          </div>
+        </>
+      )}
+      
+      {/* Hotbar */}
+      <div className={`absolute left-1/2 -translate-x-1/2 flex space-x-1 bg-black/50 p-1.5 rounded-xl backdrop-blur-md z-10 transition-all ${isMobile ? 'bottom-24 scale-90 sm:scale-100' : 'bottom-6'}`}>
+         {[1, 2, 3, 4, 5, 6, 7].map(num => (
+             <button
+                 key={num}
+                 onClick={(e) => { e.stopPropagation(); setSelectedBlock(num); }}
+                 className={`w-11 h-11 sm:w-12 sm:h-12 rounded-lg border-2 flex items-center justify-center relative transition-all cursor-pointer ${selectedBlock === num ? 'border-white scale-110 shadow-[0_0_15px_rgba(255,255,255,0.4)]' : 'border-transparent hover:border-white/50 opacity-80'}`}
+             >
+                 <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-sm shadow-inner" style={{ backgroundColor: `#${COLORS[num].toString(16).padStart(6, '0')}` }}></div>
+                 <span className="absolute -top-1.5 -right-1.5 bg-slate-800 text-white text-[9px] w-4 h-4 sm:w-5 sm:h-5 flex items-center justify-center rounded-full font-bold">{num}</span>
+             </button>
+         ))}
+      </div>
     </div>
   );
 }

@@ -469,7 +469,7 @@ export default function App() {
         ) : activeChannel === '2048' ? (
           <Game2048 />
         ) : activeChannel === 'frostcraft' ? (
-          <FrostCraft currentUser={currentUser} />
+          <FrostCraft />
         ) : (
           <>
             {/* Post Input */}

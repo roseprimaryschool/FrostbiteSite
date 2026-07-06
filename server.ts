@@ -17,42 +17,6 @@ async function startServer() {
   const connect4Rooms: Record<string, any> = {};
   const rpsRooms: Record<string, any> = {};
 
-  // FrostCraft Multiplayer Sandbox
-  const WORLD_WIDTH = 100;
-  const WORLD_HEIGHT = 50;
-  
-  let frostCraftWorld: number[][] = [];
-  for (let y = 0; y < WORLD_HEIGHT; y++) {
-    const row = [];
-    for (let x = 0; x < WORLD_WIDTH; x++) {
-      const surfaceY = 20 + Math.floor(Math.sin(x * 0.2) * 3);
-      if (y < surfaceY) row.push(0);
-      else if (y === surfaceY) row.push(1);
-      else if (y < surfaceY + 5) row.push(2);
-      else row.push(3);
-    }
-    frostCraftWorld.push(row);
-  }
-  
-  for (let x = 5; x < WORLD_WIDTH - 5; x += Math.floor(Math.random() * 10 + 5)) {
-      let surfaceY = 0;
-      for (let y = 0; y < WORLD_HEIGHT; y++) {
-         if (frostCraftWorld[y][x] === 1) { surfaceY = y; break; }
-      }
-      if (surfaceY > 0) {
-         for (let ty = 0; ty < 4; ty++) frostCraftWorld[surfaceY - 1 - ty][x] = 4;
-         for (let ly = -2; ly <= 0; ly++) {
-            for (let lx = -1; lx <= 1; lx++) {
-               if (x + lx >= 0 && x + lx < WORLD_WIDTH) {
-                 frostCraftWorld[surfaceY - 4 + ly][x + lx] = 5;
-               }
-            }
-         }
-      }
-  }
-
-  const frostCraftPlayers: Record<string, any> = {};
-
   io.on('connection', (socket) => {
     console.log('User connected:', socket.id);
 
@@ -289,45 +253,6 @@ async function startServer() {
       }
     });
 
-    // FrostCraft
-    socket.on('join_frostcraft', (user) => {
-      socket.join('frostcraft');
-      const colors = ['#ef4444', '#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899'];
-      frostCraftPlayers[socket.id] = {
-         id: socket.id,
-         user,
-         x: WORLD_WIDTH * 20 / 2, // WORLD_WIDTH * BLOCK_SIZE / 2
-         y: 0,
-         color: colors[Math.floor(Math.random() * colors.length)],
-         facing: 1
-      };
-      socket.emit('frostcraft_init', { world: frostCraftWorld, width: WORLD_WIDTH, height: WORLD_HEIGHT });
-      io.to('frostcraft').emit('frostcraft_players', frostCraftPlayers);
-    });
-
-    socket.on('frostcraft_update_pos', (data) => {
-       if (frostCraftPlayers[socket.id]) {
-          frostCraftPlayers[socket.id].x = data.x;
-          frostCraftPlayers[socket.id].y = data.y;
-          frostCraftPlayers[socket.id].facing = data.facing;
-          io.to('frostcraft').emit('frostcraft_players', frostCraftPlayers);
-       }
-    });
-
-    socket.on('frostcraft_set_block', (data) => {
-       const { x, y, type } = data;
-       if (x >= 0 && x < WORLD_WIDTH && y >= 0 && y < WORLD_HEIGHT) {
-          frostCraftWorld[y][x] = type;
-          io.to('frostcraft').emit('frostcraft_block_update', { x, y, type });
-       }
-    });
-
-    socket.on('leave_frostcraft', () => {
-       socket.leave('frostcraft');
-       delete frostCraftPlayers[socket.id];
-       io.to('frostcraft').emit('frostcraft_players', frostCraftPlayers);
-    });
-
     socket.on('disconnect', () => {
       console.log('User disconnected:', socket.id);
       // Clean up tic tac toe rooms
@@ -376,12 +301,6 @@ async function startServer() {
              io.to(roomId).emit('rps_state', room);
           }
         }
-      }
-      
-      // Clean up FrostCraft
-      if (frostCraftPlayers[socket.id]) {
-         delete frostCraftPlayers[socket.id];
-         io.to('frostcraft').emit('frostcraft_players', frostCraftPlayers);
       }
     });
   });
