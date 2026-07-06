@@ -1,0 +1,6 @@
+{
+  "name": "React App",
+  "description": "A simple React application built with Tailwind CSS.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
